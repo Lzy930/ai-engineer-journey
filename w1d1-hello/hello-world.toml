@@ -1,0 +1,83 @@
+[app]
+# 日志级别：CRITICAL / ERROR / WARNING / INFO / DEBUG
+log_level = "ERROR"
+
+# 是否流式输出（true/false）
+stream = true
+
+# 默认提供方：claude / glm（命令行 --provider 会覆盖）
+provider = "glm"
+
+# 默认 key 来源：env / paste（命令行 --key-source 会覆盖）
+key_source = "env"
+
+# 默认提示词（命令行 --prompt 会覆盖）
+prompt = "用一句话欢迎我——一位制造业 IT 负责人，今天迈出了转型 AI 应用工程师的第一步。"
+
+# 默认最大输出 token（命令行 --max-tokens 会覆盖）
+max_tokens = 300
+
+[claude]
+# 默认 Claude 模型（命令行 --claude-model 会覆盖）
+model = "claude-haiku-4-5"
+
+# 也可以把 key 放这里（不推荐明文保存）；若设置则优先于环境变量/粘贴
+# api_key = ""
+
+[glm]
+# GLM 的 OpenAI 兼容 base_url
+base_url = "https://open.bigmodel.cn/api/paas/v4/"
+
+# 默认 GLM 模型（命令行 --glm-model 会覆盖）
+model = "glm-5.1"
+
+# 也可以把 key 放这里（不推荐明文保存）；若设置则优先于环境变量/粘贴
+# api_key = ""
+
+[rag]
+# 是否默认启用 RAG（基于本地文档）。
+# 不写或留空时，运行不指定 --rag/--no-rag 会进入交互询问。
+# enabled = false
+
+# 文档目录（相对工作目录或绝对路径）。会读取该目录下的所有可解析文档。
+data_dir = "data"
+
+# 检索时取最相似的前 K 个片段
+top_k = 3
+
+# RAG 用的 LLM 模型（智谱）
+llm_model = "glm-4-plus"
+
+# RAG 用的 embedding 模型（智谱）
+embed_model = "embedding-3"
+
+# RAG 回答模板（LlamaIndex 的 text_qa_template）。
+# 必须包含两个占位符：{context_str}（检索到的资料）和 {query_str}（用户问题）。
+# 留空 / 注释掉则使用 LlamaIndex 默认模板。
+# 命令行 --rag-qa-template-file 可用文件内容覆盖此项。
+qa_template = """
+你只能使用【资料】中的明确信息回答问题。
+凡是资料中没有直接出现、无法被原文明确支持的内容，一律视为"不知道"。
+
+禁止：
+- 猜测
+- 推理过度
+- 使用外部知识
+- 使用经验判断
+- 自动补全缺失信息
+- 给出没有引用依据的结论
+
+如果问题无法被资料支持，请只回答：
+"无法从已提供资料中判断。"
+
+不要为了显得有帮助而扩展回答。
+
+【资料】
+{context_str}
+
+【问题】
+{query_str}
+
+【回答】
+"""
+
