@@ -1,0 +1,10 @@
+anthropic==0.99.0
+openai==2.34.0
+python-dotenv==1.2.2
+
+llama-index>=0.11
+llama-index-llms-zhipuai
+llama-index-embeddings-zhipuai
+llama-index-retrievers-bm25
+
+jieba>=0.42.1
