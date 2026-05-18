@@ -330,17 +330,111 @@ def _resolve_glm_key(cfg: dict[str, Any], key_source: str) -> str:
     raise RuntimeError("RAG 需要 GLM_API_KEY，但未在环境变量/配置文件中找到。")
 
 
-def _build_rag_engine(
+@dataclass
+class RAGComponents:
+    """W3D1 重构：把原 query_engine 一体化拆成可独立操作的组件。"""
+    nodes: list[Any]
+    vec_retriever: Optional[Any]
+    bm25_retriever: Optional[Any]
+    response_synthesizer: Any
+
+
+def _make_bm25_tokenizer(name: str):
+    """构造 BM25 用的分词函数。
+
+    - jieba: 中文分词，需要 jieba 包
+    - char:  按字符切分，无依赖兜底（中文召回偏弱但够用）
+    """
+    name = (name or "jieba").lower()
+    if name == "jieba":
+        try:
+            import jieba  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "BM25 需要 jieba 中文分词。请先安装：\n"
+                "  .venv/bin/pip install jieba\n"
+                "或在 hello-world.toml 设 [rag].bm25_tokenizer = \"char\" 改用字符切分。\n"
+                f"详情：{e}"
+            ) from e
+
+        def _tok(text: str) -> list[str]:
+            return [w for w in jieba.lcut(text) if w.strip()]
+
+        return _tok
+
+    if name == "char":
+        def _tok(text: str) -> list[str]:
+            return [c for c in text if c.strip()]
+
+        return _tok
+
+    raise RuntimeError(f"未知 bm25_tokenizer: {name}（仅支持 jieba / char）")
+
+
+def reciprocal_rank_fusion(
+    rank_lists: list[list[Any]],
+    k: int = 60,
+    top_n: Optional[int] = None,
+) -> list[tuple[Any, float, list[int]]]:
+    """手写 RRF（Reciprocal Rank Fusion）。
+
+    公式：score(node) = Σ_i  1 / (k + rank_i(node))
+    其中 rank_i 是 node 在第 i 个排好序的检索结果中的位置（从 1 起）。
+    没出现在某路里就不参与该路的累加。
+
+    Args:
+        rank_lists: 多路检索结果，每路是 [NodeWithScore, ...]，已按相关性降序。
+        k: RRF 平滑常数，业界默认 60。越大越平滑（高 rank 优势越被抹平）。
+        top_n: 只返回前 N 个；None = 全返回。
+
+    Returns:
+        [(node_with_score, fused_score, [rank_in_list_0, rank_in_list_1, ...]), ...]
+        按 fused_score 降序。某路未命中的 rank 记为 0。
+    """
+    score_map: dict[str, float] = {}
+    rank_map: dict[str, list[int]] = {}
+    node_map: dict[str, Any] = {}
+    n_lists = len(rank_lists)
+
+    for li, lst in enumerate(rank_lists):
+        for rank, ns in enumerate(lst, start=1):
+            nid = ns.node.node_id
+            score_map[nid] = score_map.get(nid, 0.0) + 1.0 / (k + rank)
+            if nid not in rank_map:
+                rank_map[nid] = [0] * n_lists
+            rank_map[nid][li] = rank
+            node_map[nid] = ns
+
+    sorted_ids = sorted(score_map, key=lambda x: -score_map[x])
+    if top_n is not None:
+        sorted_ids = sorted_ids[:top_n]
+    return [(node_map[nid], score_map[nid], rank_map[nid]) for nid in sorted_ids]
+
+
+def _build_rag_components(
+    *,
     api_key: str,
     data_dir: str,
     llm_model: str,
     embed_model: str,
+    retriever_mode: str,
     top_k: int,
+    chunk_size: int,
+    chunk_overlap: int,
+    bm25_tokenizer_name: str,
     streaming: bool,
-    qa_template: str | None = None,
-):
+    qa_template: Optional[str] = None,
+) -> RAGComponents:
+    """W3D1 重构核心：显式切 nodes，按 retriever_mode 构建对应的检索器与合成器。"""
     try:
-        from llama_index.core import PromptTemplate, Settings, SimpleDirectoryReader, VectorStoreIndex
+        from llama_index.core import (
+            PromptTemplate,
+            Settings,
+            SimpleDirectoryReader,
+            VectorStoreIndex,
+        )
+        from llama_index.core.node_parser import SentenceSplitter
+        from llama_index.core.response_synthesizers import get_response_synthesizer
         from llama_index.embeddings.zhipuai import ZhipuAIEmbedding
         from llama_index.llms.zhipuai import ZhipuAI
     except ImportError as e:
@@ -350,6 +444,9 @@ def _build_rag_engine(
             "llama-index-llms-zhipuai llama-index-embeddings-zhipuai\n"
             f"详情：{e}"
         ) from e
+
+    if retriever_mode not in ("vector", "bm25", "hybrid"):
+        raise RuntimeError(f"未知 retriever: {retriever_mode}（仅支持 vector / bm25 / hybrid）")
 
     if not os.path.isdir(data_dir):
         raise RuntimeError(f"未找到数据目录：{data_dir}（用 --data-dir 指定，或在配置文件 [rag] 里设置）")
@@ -362,37 +459,126 @@ def _build_rag_engine(
         raise RuntimeError(f"目录 {data_dir} 内没有可加载的文档")
     logger.info("已加载 %d 个文档（来自 %s）", len(documents), data_dir)
 
-    index = VectorStoreIndex.from_documents(documents)
+    splitter = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    nodes = splitter.get_nodes_from_documents(documents)
+    if not nodes:
+        raise RuntimeError("切片后未产生任何 node，检查 chunk_size / 文档内容")
+    logger.info(
+        "切出 %d 个 node（chunk_size=%d, overlap=%d）",
+        len(nodes), chunk_size, chunk_overlap,
+    )
 
-    engine_kwargs: dict[str, Any] = {"streaming": streaming, "similarity_top_k": top_k}
+    vec_retriever = None
+    bm25_retriever = None
+
+    if retriever_mode in ("vector", "hybrid"):
+        vector_index = VectorStoreIndex(nodes)
+        vec_retriever = vector_index.as_retriever(similarity_top_k=top_k)
+        logger.info("已构建向量 retriever（top_k=%d）", top_k)
+
+    if retriever_mode in ("bm25", "hybrid"):
+        try:
+            from llama_index.retrievers.bm25 import BM25Retriever
+        except ImportError as e:
+            raise RuntimeError(
+                "缺少 BM25 依赖。请先安装：\n"
+                "  .venv/bin/pip install llama-index-retrievers-bm25\n"
+                f"详情：{e}"
+            ) from e
+        tokenizer = _make_bm25_tokenizer(bm25_tokenizer_name)
+        bm25_retriever = BM25Retriever.from_defaults(
+            nodes=nodes,
+            similarity_top_k=top_k,
+            tokenizer=tokenizer,
+        )
+        logger.info("已构建 BM25 retriever（top_k=%d, tokenizer=%s）", top_k, bm25_tokenizer_name)
+
+    synth_kwargs: dict[str, Any] = {"streaming": streaming}
     if qa_template:
         tmpl = qa_template.strip()
-        # LlamaIndex 模板必须包含 {context_str} 和 {query_str} 两个占位符
         missing = [p for p in ("{context_str}", "{query_str}") if p not in tmpl]
         if missing:
             raise RuntimeError(
                 f"RAG qa_template 缺少必须占位符：{missing}（必须同时包含 {{context_str}} 和 {{query_str}}）"
             )
-        engine_kwargs["text_qa_template"] = PromptTemplate(tmpl)
+        synth_kwargs["text_qa_template"] = PromptTemplate(tmpl)
         logger.info("已应用自定义 RAG qa_template（%d chars）", len(tmpl))
 
-    return index.as_query_engine(**engine_kwargs)
+    response_synthesizer = get_response_synthesizer(**synth_kwargs)
+
+    return RAGComponents(
+        nodes=nodes,
+        vec_retriever=vec_retriever,
+        bm25_retriever=bm25_retriever,
+        response_synthesizer=response_synthesizer,
+    )
 
 
-def _log_rag_sources(response: Any) -> None:
-    sources = getattr(response, "source_nodes", []) or []
-    if not sources:
+def _snippet(node_with_score: Any, max_len: int = 120) -> str:
+    try:
+        text = node_with_score.node.get_content().strip().replace("\n", " ")
+    except Exception:
+        text = str(node_with_score)
+    return text[:max_len] + ("..." if len(text) > max_len else "")
+
+
+def _log_retrieval(
+    mode: str,
+    *,
+    vec_list: Optional[list[Any]] = None,
+    bm25_list: Optional[list[Any]] = None,
+    fused_tuples: Optional[list[tuple[Any, float, list[int]]]] = None,
+) -> None:
+    """打印检索阶段命中。
+
+    - vector / bm25 单路：直接列 [rank] score text
+    - hybrid：列融合后的 top_n，附带 [vec=#? bm25=#? fused=#? score=...]，方便看每个候选在两路里的位置
+    """
+    if mode == "vector" and vec_list:
+        logger.info("retriever=vector 命中 %d 个 node", len(vec_list))
+        for i, ns in enumerate(vec_list, 1):
+            score = getattr(ns, "score", None)
+            score_s = f"{score:.3f}" if isinstance(score, float) else str(score)
+            logger.info("  [%d] vec_score=%s text=%s", i, score_s, _snippet(ns))
         return
-    logger.info("命中片段数: %d", len(sources))
-    for i, sn in enumerate(sources, 1):
-        score = getattr(sn, "score", None)
-        try:
-            text = sn.node.get_content().strip().replace("\n", " ")
-        except Exception:
-            text = str(sn)
-        snippet = text[:120] + ("..." if len(text) > 120 else "")
-        score_s = f"{score:.3f}" if isinstance(score, float) else str(score)
-        logger.info("  [%d] score=%s text=%s", i, score_s, snippet)
+
+    if mode == "bm25" and bm25_list:
+        logger.info("retriever=bm25 命中 %d 个 node", len(bm25_list))
+        for i, ns in enumerate(bm25_list, 1):
+            score = getattr(ns, "score", None)
+            score_s = f"{score:.3f}" if isinstance(score, float) else str(score)
+            logger.info("  [%d] bm25_score=%s text=%s", i, score_s, _snippet(ns))
+        return
+
+    if mode == "hybrid":
+        vec_list = vec_list or []
+        bm25_list = bm25_list or []
+        fused_tuples = fused_tuples or []
+
+        # 先把单路 ranking 也打出来，方便人工对照融合前后的差异
+        logger.info("retriever=hybrid 单路向量召回 %d 个", len(vec_list))
+        for i, ns in enumerate(vec_list, 1):
+            score = getattr(ns, "score", None)
+            score_s = f"{score:.3f}" if isinstance(score, float) else str(score)
+            logger.info("  vec[%d] score=%s text=%s", i, score_s, _snippet(ns))
+
+        logger.info("retriever=hybrid 单路 BM25 召回 %d 个", len(bm25_list))
+        for i, ns in enumerate(bm25_list, 1):
+            score = getattr(ns, "score", None)
+            score_s = f"{score:.3f}" if isinstance(score, float) else str(score)
+            logger.info("  bm25[%d] score=%s text=%s", i, score_s, _snippet(ns))
+
+        logger.info("retriever=hybrid 融合后取 %d 个（RRF）", len(fused_tuples))
+        for i, (ns, fused, ranks) in enumerate(fused_tuples, 1):
+            vec_rank = ranks[0] if len(ranks) >= 1 else 0
+            bm25_rank = ranks[1] if len(ranks) >= 2 else 0
+            vec_s = f"#{vec_rank}" if vec_rank else "—"
+            bm25_s = f"#{bm25_rank}" if bm25_rank else "—"
+            logger.info(
+                "  fused[%d] vec=%s bm25=%s rrf_score=%.4f text=%s",
+                i, vec_s, bm25_s, fused, _snippet(ns),
+            )
+        return
 
 
 def answer_with_rag(
@@ -402,27 +588,74 @@ def answer_with_rag(
     data_dir: str,
     llm_model: str,
     embed_model: str,
+    retriever_mode: str,
     top_k: int,
+    chunk_size: int,
+    chunk_overlap: int,
+    bm25_tokenizer_name: str,
+    rrf_k: int,
     streaming: bool,
-    qa_template: str | None = None,
+    qa_template: Optional[str] = None,
 ) -> RunResult:
+    """W3D1 重构：vector / bm25 / hybrid 三模式共用同一份 nodes + LLM。
+
+    流程：
+      1. _build_rag_components 拿 nodes / retriever(s) / synthesizer
+      2. 按 mode 跑 retrieve（hybrid 跑两路 + 手写 RRF 融合）
+      3. synthesizer.synthesize 用融合后的 nodes 出回答
+      4. 打日志（hybrid 模式打三路 rank）
+    """
     try:
-        engine = _build_rag_engine(
+        from llama_index.core.schema import NodeWithScore
+
+        components = _build_rag_components(
             api_key=api_key,
             data_dir=data_dir,
             llm_model=llm_model,
             embed_model=embed_model,
+            retriever_mode=retriever_mode,
             top_k=top_k,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            bm25_tokenizer_name=bm25_tokenizer_name,
             streaming=streaming,
             qa_template=qa_template,
         )
-        response = engine.query(question)
+
+        # ---- Retrieve ----
+        vec_list: Optional[list[Any]] = None
+        bm25_list: Optional[list[Any]] = None
+        fused_tuples: Optional[list[tuple[Any, float, list[int]]]] = None
+
+        if retriever_mode == "vector":
+            assert components.vec_retriever is not None
+            vec_list = components.vec_retriever.retrieve(question)
+            nodes_for_synth = vec_list
+        elif retriever_mode == "bm25":
+            assert components.bm25_retriever is not None
+            bm25_list = components.bm25_retriever.retrieve(question)
+            nodes_for_synth = bm25_list
+        else:  # hybrid
+            assert components.vec_retriever is not None
+            assert components.bm25_retriever is not None
+            vec_list = components.vec_retriever.retrieve(question)
+            bm25_list = components.bm25_retriever.retrieve(question)
+            fused_tuples = reciprocal_rank_fusion(
+                [vec_list, bm25_list], k=rrf_k, top_n=top_k,
+            )
+            # 用 fused_score 重新包装 NodeWithScore，这样后续日志/下游能看到 RRF 分数
+            nodes_for_synth = [
+                NodeWithScore(node=ns.node, score=fused)
+                for ns, fused, _ in fused_tuples
+            ]
+
+        # ---- Synthesize ----
+        response = components.response_synthesizer.synthesize(question, nodes=nodes_for_synth)
 
         text_parts: list[str] = []
         if streaming:
             gen = getattr(response, "response_gen", None)
             if gen is None:
-                # 部分版本不暴露 response_gen，退回 str()
                 full = str(response)
                 print(full, end="", flush=True)
                 text_parts.append(full)
@@ -440,10 +673,18 @@ def answer_with_rag(
             sys.stdout.flush()
             text_parts.append(full)
 
-        _log_rag_sources(response)
-        return RunResult(provider="rag(glm)", model=llm_model, text="".join(text_parts))
+        _log_retrieval(
+            retriever_mode,
+            vec_list=vec_list,
+            bm25_list=bm25_list,
+            fused_tuples=fused_tuples,
+        )
+        return RunResult(
+            provider=f"rag-{retriever_mode}(glm)",
+            model=llm_model,
+            text="".join(text_parts),
+        )
     except Exception as e:
-        # 已经是 RuntimeError（依赖/数据目录）就直接抛；其它包成更友好的提示
         if isinstance(e, RuntimeError):
             raise
         raise RuntimeError(f"RAG 请求失败：{type(e).__name__}: {e}") from e
@@ -464,6 +705,36 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--rag-top-k", type=int, default=None)
     parser.add_argument("--rag-llm-model", default=None)
     parser.add_argument("--rag-embed-model", default=None)
+    parser.add_argument(
+        "--retriever",
+        choices=["vector", "bm25", "hybrid"],
+        default=None,
+        help="RAG 检索器：vector(纯向量) / bm25(纯关键词) / hybrid(RRF 融合)。覆盖配置文件 [rag].retriever。",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="文档切片大小（覆盖 [rag].chunk_size）。",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=None,
+        help="文档切片重叠（覆盖 [rag].chunk_overlap）。",
+    )
+    parser.add_argument(
+        "--bm25-tokenizer",
+        choices=["jieba", "char"],
+        default=None,
+        help="BM25 分词器（覆盖 [rag].bm25_tokenizer）。",
+    )
+    parser.add_argument(
+        "--rrf-k",
+        type=int,
+        default=None,
+        help="RRF 平滑常数 k（hybrid 模式生效，覆盖 [rag].rrf_k，默认 60）。",
+    )
     parser.add_argument(
         "--rag-qa-template-file",
         default=None,
@@ -555,6 +826,15 @@ def main(argv: list[str]) -> int:
         rag_top_k = args.rag_top_k if args.rag_top_k is not None else int(_cfg_get(cfg, ["rag", "top_k"], 3))
         rag_llm_model = args.rag_llm_model or _cfg_get(cfg, ["rag", "llm_model"], "glm-4-plus")
         rag_embed_model = args.rag_embed_model or _cfg_get(cfg, ["rag", "embed_model"], "embedding-3")
+        retriever_mode = args.retriever or _cfg_get(cfg, ["rag", "retriever"], "vector")
+        chunk_size = args.chunk_size if args.chunk_size is not None else int(_cfg_get(cfg, ["rag", "chunk_size"], 512))
+        chunk_overlap = (
+            args.chunk_overlap
+            if args.chunk_overlap is not None
+            else int(_cfg_get(cfg, ["rag", "chunk_overlap"], 50))
+        )
+        bm25_tokenizer_name = args.bm25_tokenizer or _cfg_get(cfg, ["rag", "bm25_tokenizer"], "jieba")
+        rrf_k = args.rrf_k if args.rrf_k is not None else int(_cfg_get(cfg, ["rag", "rrf_k"], 60))
 
         # 回答模板：命令行文件 > 配置文件 > 不设（用 LlamaIndex 默认）
         qa_template: Optional[str] = None
@@ -571,8 +851,11 @@ def main(argv: list[str]) -> int:
                 qa_template = cfg_tmpl
 
         logger.info(
-            "rag=on data_dir=%s top_k=%s llm=%s embed=%s key=%s qa_template=%s",
-            data_dir, rag_top_k, rag_llm_model, rag_embed_model, _mask_key(glm_key),
+            "rag=on retriever=%s data_dir=%s top_k=%s chunk=%s/%s bm25_tok=%s rrf_k=%s "
+            "llm=%s embed=%s key=%s qa_template=%s",
+            retriever_mode, data_dir, rag_top_k, chunk_size, chunk_overlap,
+            bm25_tokenizer_name, rrf_k,
+            rag_llm_model, rag_embed_model, _mask_key(glm_key),
             "custom" if qa_template else "default",
         )
         try:
@@ -582,7 +865,12 @@ def main(argv: list[str]) -> int:
                 data_dir=str(data_dir),
                 llm_model=str(rag_llm_model),
                 embed_model=str(rag_embed_model),
+                retriever_mode=str(retriever_mode),
                 top_k=int(rag_top_k),
+                chunk_size=int(chunk_size),
+                chunk_overlap=int(chunk_overlap),
+                bm25_tokenizer_name=str(bm25_tokenizer_name),
+                rrf_k=int(rrf_k),
                 streaming=stream_enabled,
                 qa_template=qa_template,
             )
