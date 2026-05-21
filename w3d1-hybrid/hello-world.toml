@@ -57,9 +57,11 @@ retriever = "hybrid"
 chunk_size = 512
 chunk_overlap = 50
 
-# BM25 中文分词器（W3D1 新增）：jieba | char
-#   jieba — 用 jieba 中文分词（推荐）
-#   char  — 按字切（无依赖兜底）
+# BM25 中文分词策略（W3D1 字段，W3D4 修正）。
+# 历史：W3D1 时配置 jieba/char 选择"分词函数"，但 BM25Retriever 的 tokenizer 参数实际被
+# 静默丢弃，jieba 从未生效（详见 w3d1-hybrid/README.md "5.21 BM25 真相反转"）。
+# 现状：BM25 用写死的中文 char-level token_pattern（英文/数字按 word，中文按字）。
+# 此字段当前**不影响实际行为**，仅作为 W4"真正词级 jieba BM25"实现时的开关位预留。
 bm25_tokenizer = "jieba"
 
 # RRF 融合常数 k（hybrid 模式生效）。
@@ -73,10 +75,23 @@ llm_model = "glm-4-plus"
 # RAG 用的 embedding 模型（智谱）
 embed_model = "embedding-3"
 
-# RAG 回答模板（LlamaIndex 的 text_qa_template）。
+# ===== RAG 回答模板（W3D4 加入题型路由）=====
+#
 # 必须包含两个占位符：{context_str}（检索到的资料）和 {query_str}（用户问题）。
-# 留空 / 注释掉则使用 LlamaIndex 默认模板。
-# 命令行 --rag-qa-template-file 可用文件内容覆盖此项。
+# 不设任何模板时使用 LlamaIndex 默认（英文 prompt，可跑中文，但不可控）。
+#
+# 三种指定方式（优先级 1 > 2 > 3 > 4）：
+#   1. 命令行 --rag-qa-template-file <path>  显式文件，调试最方便
+#   2. 命令行 --question-type <type>          语义路由，查 [rag.templates] 表
+#   3. toml 下方 qa_template 字段             老字段，兼容 W3D1 以前的行为
+#   4. (不设)                                 LlamaIndex 默认英文 prompt
+#
+# default_question_type：不传 --question-type 时使用的默认题型。
+# 留空字符串 "" 表示"不走语义路由，走第 3 优先级 qa_template 字段"（向后兼容）。
+default_question_type = ""
+
+# 旧版兜底模板（W3D1 及之前的默认行为）。一旦上面 default_question_type 设了非空值
+# 或命令行传了 --question-type/--rag-qa-template-file，下方 qa_template 会被忽略。
 qa_template = """
 你只能使用【资料】中的明确信息回答问题。
 凡是资料中没有直接出现、无法被原文明确支持的内容，一律视为"不知道"。
@@ -102,4 +117,13 @@ qa_template = """
 
 【回答】
 """
+
+# 题型 → 模板文件 映射。新增题型只需在此表加一行 + 写对应 prompts/xxx.txt 文件。
+# (子表必须在 [rag] 段所有标量字段之后，这是 toml 语法要求)
+[rag.templates]
+factual    = "prompts/qa_factual.txt"
+subjective = "prompts/qa_subjective.txt"
+# 未来扩展示例：
+# high_risk_strict = "prompts/qa_high_risk.txt"
+# comparison       = "prompts/qa_comparison.txt"
 

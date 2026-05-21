@@ -137,7 +137,64 @@ python hello-world.py --rag --retriever hybrid --question "李哲羽今年多大
 - **Test 2**：原文白纸黑字写着"事故编号 E-7429 发生在 2026 年 5 月 17 日晚间"，问题用"事故"原文用"故障记录 / 故障现象"，字面不完全匹配，LLM 在 `qa_template` "凡是资料中没有直接出现、无法被原文明确支持的内容，一律视为不知道" 的约束下选择拒答。
 - **Test 3**：这恰好是向量检索本该发光的场景（语义改写：原文"到货窗口后移" vs 问题"影响下月交付"），向量召回也确实命中了正确片段，但被 prompt 严格度抹杀。
 
-**洞察**：RAG 不是一个 prompt 搞定所有场景的活——**事实题需要宽松让 LLM 敢答，主观题需要严格不让它乱编，这两件事应该分开**。当前 `qa_template` 是 W2 修"主观题瞎编"时引入的强约束，治好了瞎编，但反过来咬了事实题。下一步：分层 `qa_template`（事实型 / 主观型双模板）。
+**洞察**：RAG 不是一个 prompt 搞定所有场景的活——**事实题需要宽松让 LLM 敢答，主观题需要严格不让它乱编，这两件事应该分开**。当前 `qa_template` 是 W2 修"主观题瞎编"时引入的强约束，治好了瞎编，但反过来咬了事实题。**下一步在 W3D4 落地**：分层 `qa_template` + 题型路由。
+
+## W3D4：题型路由（factual / subjective）
+
+把 5.18 发现的"prompt 太严"问题拆成两个工件：
+
+**1. prompts/ 目录拆出两份模板**
+
+```
+prompts/qa_factual.txt    宽松：允许同义/近义/改写匹配，事实题用
+prompts/qa_subjective.txt 严格：凡资料未明确出现一律拒答，主观/高风险题用
+```
+
+**2. `[rag.templates]` 路由表（hello-world.toml）**
+
+```toml
+default_question_type = ""   # 不指定时退化到 toml.qa_template 字段（向后兼容）
+
+[rag.templates]
+factual    = "prompts/qa_factual.txt"
+subjective = "prompts/qa_subjective.txt"
+```
+
+**3. CLI 加 `--question-type {factual|subjective}`**
+
+```bash
+python hello-world.py --rag --retriever hybrid --rag-top-k 5 \
+  --question-type factual \
+  --question "E-7429 是什么事故？发生在什么时候？"
+```
+
+**模板优先级**：`--rag-qa-template-file` > `--question-type` > `[rag].qa_template` > LlamaIndex 默认。日志里会打出 `template=question_type=factual -> prompts/qa_factual.txt`，方便后续按题型分组评估。
+
+### 4 题 × 2 题型 回归对比（W3D4）
+
+同样 `top_k=5 / hybrid / chunk_size=512`，跑脚本 `run_question_type_compare.sh`：
+
+| # | 问题 | factual（宽松） | subjective（严格） |
+|---|---|---|---|
+| 1 | VFD-F17 是什么报警？ | ✅ 答出 | ✅ 答出 |
+| 2 | E-7429 是什么事故？ | ✅ **救回**（5.18 拒答 → 通过） | ✅ 通过（不稳定，会受 LLM 随机性影响） |
+| 3 | 哪些供应商可能影响下月交付？ | ⚠️ **半救回**：诚实回答"资料中未提及具体供应商名称" | ❌ 拒答（与 5.18 一致） |
+| 4 | RAG 模型为什么会胡编内容？ | ✅ 答出（含 5.9 修复方案细节） | ❌ **意外拒答**（5.18 通过 → 今天拒答） |
+
+**修正版洞察**（覆盖 5.18 的"事实宽松、主观严格"二分法）：
+
+1. **factual 模板表现最稳**：4/4 全部给出有效回答，且 Test 3 没瞎编（诚实承认资料里只有间接表述）—— **prompt 设计中"允许语义改写 + 强制诚实兜底"是有效组合**。
+2. **subjective 模板"太严"**：不仅误杀事实题（Test 2/3），还可能误杀本应回答的主观题（Test 4）。当前这套是 5.9 为修瞎编引入的，**适用场景应缩到"法律/医疗/合规"等高风险场景**，不是普通主观题。
+3. **"主观题"应该再细分**：普通主观题需要"允许基于资料推理 + 禁止外部知识"的中间档 prompt（未来 `comparison` / `causal` 题型留好了路由位）。
+
+### 为什么要做"题型路由"而不只是"两份 prompt 文件"？
+
+把"prompt 选择"从"裸文件路径"升级成"业务概念"，意义有 4 层：
+
+1. **语义化抽象**：使用者只回答"我问的是什么类型的问题"，不关心实现文件路径。
+2. **可扩展**：新增题型只在 `[rag.templates]` 加一行，业务侧零改动。
+3. **可评估**：题型标签是按题型分组算成功率的前置条件，是 W4 ragas 评估的输入。**整体准确率告诉不了你"该改 prompt 还是该改 retriever"**。
+4. **可演进**：今天 `--question-type` 是手动指定（V1）；V2 可以接一个便宜小模型做题型分类 agent，从手动 RAG 走向 Agent-based RAG，路由表不动。
 
 ## 关键配置（hello-world.toml `[rag]` 段）
 
@@ -178,6 +235,44 @@ score_map[nid] = score_map.get(nid, 0.0) + 1.0 / (k + rank)
 - LlamaIndex 自带 `QueryFusionRetriever`，但内部融合后只暴露最终 score，看不到原始两路 rank。
 - 手写之后能在日志里精确打出 `vec=#? bm25=#? rrf_score=?`，反向调试每个候选"为什么进 top_k"。
 - 走的坑：忘记给"没命中"的 rank 留 0，导致 rank_map 长度不一致。修正：每个 node 首次出现时先初始化 `[0] * n_lists`。
+
+### 5.21 — BM25 真相反转：jieba 从来没生效过
+
+清理 5.18 backlog #4（`tokenizer` 参数 deprecation warning）时翻源码，发现一个 5.18 没看到的真相：
+
+`BM25Retriever.from_defaults(tokenizer=callable)` 这个参数虽然接收，但**只打 warning 后被静默丢弃**，从来没传给底层 `bm25s` 构造器。也就是说 W3D1 以来配置的 jieba 分词从来没生效过。BM25 一直在用 `bm25s` 默认的英文 token_pattern `(?u)\b\w\w+\b`，对中文几乎切不出任何 token。
+
+这就是 5.18 README "BM25 score 全是 0（IDF 退化）" 一节的**真实底层原因 —— 不是 IDF 退化，是根本没切到中文词**。当时之所以 hybrid 还能 4/4 命中正确 chunk，是因为：（1）问题里都含 `VFD-F17` / `E-7429` 这种英文+数字 token，默认 pattern 切得出；（2）BM25 返回 top_k 时即使 score=0 也会 fall back 返回前几条，碰巧排序和 vector 一致。**hybrid 看起来在工作，其实 BM25 那一路是"无信息地猜对了"**。
+
+修法（最小改动，0 额外依赖）：
+
+```python
+BM25_TOKEN_PATTERN_CN = r"(?u)\w+|[\u4e00-\u9fff]"  # 英文/数字按 word + 中文按字
+
+BM25Retriever.from_defaults(
+    nodes=nodes,
+    similarity_top_k=top_k,
+    token_pattern=BM25_TOKEN_PATTERN_CN,
+    skip_stemming=True,  # 中文不需要 stemming
+    language="en",       # stopwords 用英文表（中文不会命中）
+)
+```
+
+修复前后对比（Test 2 `E-7429 是什么事故？` 在纯 BM25 模式下）：
+
+| 时间 | bm25[1] score | 说明 |
+|---|---|---|
+| 5.18（修复前） | ≈ 0 | jieba 没生效，默认 pattern 切不出中文 |
+| 5.21（修复后） | **2.028** | 真正基于 IDF 的命中 |
+
+更进一步的"真正词级中文 BM25"（jieba 包装 retriever，corpus + query 两侧都预切）实现起来更重，留给 W4。当前 char-level 中文 BM25 已经足够支撑 hybrid 检索（实测 4/4 命中保持）。
+
+**给读者的提醒**：用 LlamaIndex / 任何 RAG 框架的高层 API 时，**任何带 deprecation warning 的参数都值得查一下源码确认有没有被静默吞掉**。这次踩坑成本 = 几乎重写一次拆解笔记的检索层故事。
+
+### 5.21 — qa_template 分层 + 题型路由
+- 5.18 测试时 4/4 检索命中但 2/4 LLM 拒答，根因是单一 prompt 同时管事实题 + 主观题相互打架。今晚把它落成代码：拆 prompt 文件 + 加 `--question-type` 路由表。
+- 跑完发现一个 5.18 没看到的现象：**严格 prompt 不仅误杀事实题，也会误杀主观题**（Test 4 在严格模板下今天反而拒答了）。所以"事实宽松 / 主观严格"二分法不够，至少要预留"中间档 prompt"位置。路由表 `[rag.templates]` 加一行就行，验证了"配置化"的扩展性。
+- 把"模板选择"从命令行裸文件路径升级到业务概念（factual / subjective）后，**有了题型标签才能做按题型分组的评估**（W4 ragas 的前置条件）。这是路由表真正的长期价值，不只是写起来短。
 
 ## 反思
 

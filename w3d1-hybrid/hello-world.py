@@ -339,36 +339,17 @@ class RAGComponents:
     response_synthesizer: Any
 
 
-def _make_bm25_tokenizer(name: str):
-    """构造 BM25 用的分词函数。
-
-    - jieba: 中文分词，需要 jieba 包
-    - char:  按字符切分，无依赖兜底（中文召回偏弱但够用）
-    """
-    name = (name or "jieba").lower()
-    if name == "jieba":
-        try:
-            import jieba  # type: ignore
-        except ImportError as e:
-            raise RuntimeError(
-                "BM25 需要 jieba 中文分词。请先安装：\n"
-                "  .venv/bin/pip install jieba\n"
-                "或在 hello-world.toml 设 [rag].bm25_tokenizer = \"char\" 改用字符切分。\n"
-                f"详情：{e}"
-            ) from e
-
-        def _tok(text: str) -> list[str]:
-            return [w for w in jieba.lcut(text) if w.strip()]
-
-        return _tok
-
-    if name == "char":
-        def _tok(text: str) -> list[str]:
-            return [c for c in text if c.strip()]
-
-        return _tok
-
-    raise RuntimeError(f"未知 bm25_tokenizer: {name}（仅支持 jieba / char）")
+# W3D4 发现：BM25Retriever.from_defaults 的 tokenizer 参数已 deprecated，
+# 而且实际是被静默吞掉的（只打 warning，不会传给底层 bm25s）。原 _make_bm25_tokenizer
+# 函数（jieba / char 两个实现）从 W3D1 起就没生效过 —— BM25 一直在用 bm25s 默认的
+# 英文 token_pattern (\b\w\w+\b)，几乎切不出任何中文。
+#
+# 治本方案是写一个 jieba 包装 retriever（corpus + query 两侧都用 jieba 预切再喂 bm25s），
+# 复杂度较高，留给 W4。
+#
+# 当前临时方案：用中文友好的 token_pattern —— 英文/数字按 word 切，中文按字切（char-level
+# 中文 BM25）。0 额外依赖、立即激活中文 BM25。配合 skip_stemming=True（中文不需 stemming）。
+BM25_TOKEN_PATTERN_CN = r"(?u)\w+|[\u4e00-\u9fff]"
 
 
 def reciprocal_rank_fusion(
@@ -485,13 +466,27 @@ def _build_rag_components(
                 "  .venv/bin/pip install llama-index-retrievers-bm25\n"
                 f"详情：{e}"
             ) from e
-        tokenizer = _make_bm25_tokenizer(bm25_tokenizer_name)
+
+        # W3D4：从 deprecated 的 tokenizer=callable 改成 token_pattern + skip_stemming，
+        # 用中文友好正则激活中文 BM25。bm25_tokenizer_name 参数现在只用于日志/留作 W4 jieba
+        # 包装的开关位，不再实际控制分词逻辑（详见 BM25_TOKEN_PATTERN_CN 注释）。
+        if bm25_tokenizer_name and bm25_tokenizer_name.lower() == "jieba":
+            logger.warning(
+                "bm25_tokenizer=jieba 当前未实现真正的词级 BM25（W4 待办），"
+                "正在用中文 char-level token_pattern 兜底。"
+            )
+
         bm25_retriever = BM25Retriever.from_defaults(
             nodes=nodes,
             similarity_top_k=top_k,
-            tokenizer=tokenizer,
+            token_pattern=BM25_TOKEN_PATTERN_CN,
+            skip_stemming=True,
+            language="en",
         )
-        logger.info("已构建 BM25 retriever（top_k=%d, tokenizer=%s）", top_k, bm25_tokenizer_name)
+        logger.info(
+            "已构建 BM25 retriever（top_k=%d, token_pattern=cn_char_word, skip_stemming=True）",
+            top_k,
+        )
 
     synth_kwargs: dict[str, Any] = {"streaming": streaming}
     if qa_template:
@@ -738,7 +733,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--rag-qa-template-file",
         default=None,
-        help="从文件读取 RAG 回答模板，覆盖配置文件 [rag].qa_template。",
+        help="从文件读取 RAG 回答模板，最高优先级。",
+    )
+    parser.add_argument(
+        "--question-type",
+        default=None,
+        help=(
+            "题型路由：按 [rag.templates] 表把题型名映射到 prompts/xxx.txt。"
+            "默认题型走 [rag].default_question_type。"
+            "可选值由配置文件决定，未知值会列出所有可选项。"
+        ),
     )
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--claude-model", default=os.getenv("CLAUDE_MODEL", "claude-haiku-4.5"))
@@ -836,27 +840,60 @@ def main(argv: list[str]) -> int:
         bm25_tokenizer_name = args.bm25_tokenizer or _cfg_get(cfg, ["rag", "bm25_tokenizer"], "jieba")
         rrf_k = args.rrf_k if args.rrf_k is not None else int(_cfg_get(cfg, ["rag", "rrf_k"], 60))
 
-        # 回答模板：命令行文件 > 配置文件 > 不设（用 LlamaIndex 默认）
+        # 回答模板优先级（W3D4 加入题型路由）：
+        #   1) --rag-qa-template-file <path>        显式文件，最高优先级
+        #   2) --question-type <type> / default_question_type
+        #                                           语义路由，查 [rag.templates] 表
+        #   3) [rag].qa_template                    老字段，向后兼容
+        #   4) (都没有)                              LlamaIndex 默认英文 prompt
         qa_template: Optional[str] = None
-        if args.rag_qa_template_file:
+        template_source: str = "llama_index_default"
+        templates_map = _cfg_get(cfg, ["rag", "templates"], {}) or {}
+        default_qtype = str(_cfg_get(cfg, ["rag", "default_question_type"], "") or "").strip()
+        effective_qtype = (args.question_type or default_qtype).strip()
+
+        def _load_template_file(path: str, src_label: str) -> Optional[str]:
             try:
-                with open(args.rag_qa_template_file, "r", encoding="utf-8") as f:
-                    qa_template = f.read()
-            except OSError as e:
-                print(f"[错误] 读取 RAG 模板文件失败：{e}", file=sys.stderr)
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except OSError as exc:
+                print(
+                    f"[错误] 读取 RAG 模板文件失败 (source={src_label}): {exc}",
+                    file=sys.stderr,
+                )
+                return None
+
+        if args.rag_qa_template_file:
+            qa_template = _load_template_file(args.rag_qa_template_file, "file")
+            if qa_template is None:
                 return 2
+            template_source = f"file({args.rag_qa_template_file})"
+        elif effective_qtype:
+            if effective_qtype not in templates_map:
+                available = ", ".join(sorted(templates_map.keys())) or "(空，请在 [rag.templates] 配置)"
+                print(
+                    f"[错误] 未知 question_type: {effective_qtype!r}（可选：{available}）",
+                    file=sys.stderr,
+                )
+                return 2
+            mapped_path = str(templates_map[effective_qtype])
+            qa_template = _load_template_file(mapped_path, f"question_type={effective_qtype}")
+            if qa_template is None:
+                return 2
+            template_source = f"question_type={effective_qtype} -> {mapped_path}"
         else:
             cfg_tmpl = _cfg_get(cfg, ["rag", "qa_template"], None)
             if isinstance(cfg_tmpl, str) and cfg_tmpl.strip():
                 qa_template = cfg_tmpl
+                template_source = "toml.qa_template"
 
         logger.info(
             "rag=on retriever=%s data_dir=%s top_k=%s chunk=%s/%s bm25_tok=%s rrf_k=%s "
-            "llm=%s embed=%s key=%s qa_template=%s",
+            "llm=%s embed=%s key=%s template=%s",
             retriever_mode, data_dir, rag_top_k, chunk_size, chunk_overlap,
             bm25_tokenizer_name, rrf_k,
             rag_llm_model, rag_embed_model, _mask_key(glm_key),
-            "custom" if qa_template else "default",
+            template_source,
         )
         try:
             answer_with_rag(
