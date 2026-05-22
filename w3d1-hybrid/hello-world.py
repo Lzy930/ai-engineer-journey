@@ -405,6 +405,9 @@ def _build_rag_components(
     bm25_tokenizer_name: str,
     streaming: bool,
     qa_template: Optional[str] = None,
+    chroma_enabled: bool = False,
+    chroma_persist_dir: Optional[str] = None,
+    chroma_collection: Optional[str] = None,
 ) -> RAGComponents:
     """W3D1 重构核心：显式切 nodes，按 retriever_mode 构建对应的检索器与合成器。"""
     try:
@@ -453,7 +456,39 @@ def _build_rag_components(
     bm25_retriever = None
 
     if retriever_mode in ("vector", "hybrid"):
-        vector_index = VectorStoreIndex(nodes)
+        # W3D5 C1：若开启 Chroma 持久化，把向量存储从内存 SimpleVectorStore 换成
+        # ChromaVectorStore（PersistentClient 写盘）。本阶段只做 ingest + 落盘；
+        # 二次启动仍会重建（重算 embedding 后写入同一 collection）。
+        # 二次启动跳过 ingest、直接 load 索引复用，留给 W3D6 (5.23) C2 阶段。
+        storage_context = None
+        if chroma_enabled:
+            try:
+                import chromadb
+                from llama_index.core import StorageContext
+                from llama_index.vector_stores.chroma import ChromaVectorStore
+            except ImportError as e:
+                raise RuntimeError(
+                    "缺少 Chroma 依赖。请先安装：\n"
+                    "  .venv/bin/pip install chromadb llama-index-vector-stores-chroma\n"
+                    f"详情：{e}"
+                ) from e
+
+            persist_dir = chroma_persist_dir or "./chroma_db"
+            coll_name = chroma_collection or "rag_default"
+            os.makedirs(persist_dir, exist_ok=True)
+            chroma_client = chromadb.PersistentClient(path=persist_dir)
+            chroma_collection_obj = chroma_client.get_or_create_collection(coll_name)
+            vector_store = ChromaVectorStore(chroma_collection=chroma_collection_obj)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            logger.info(
+                "已启用 Chroma 持久化向量库（persist_dir=%s, collection=%s, mode=ingest+persist）",
+                persist_dir, coll_name,
+            )
+
+        if storage_context is not None:
+            vector_index = VectorStoreIndex(nodes, storage_context=storage_context)
+        else:
+            vector_index = VectorStoreIndex(nodes)
         vec_retriever = vector_index.as_retriever(similarity_top_k=top_k)
         logger.info("已构建向量 retriever（top_k=%d）", top_k)
 
@@ -591,6 +626,9 @@ def answer_with_rag(
     rrf_k: int,
     streaming: bool,
     qa_template: Optional[str] = None,
+    chroma_enabled: bool = False,
+    chroma_persist_dir: Optional[str] = None,
+    chroma_collection: Optional[str] = None,
 ) -> RunResult:
     """W3D1 重构：vector / bm25 / hybrid 三模式共用同一份 nodes + LLM。
 
@@ -615,6 +653,9 @@ def answer_with_rag(
             bm25_tokenizer_name=bm25_tokenizer_name,
             streaming=streaming,
             qa_template=qa_template,
+            chroma_enabled=chroma_enabled,
+            chroma_persist_dir=chroma_persist_dir,
+            chroma_collection=chroma_collection,
         )
 
         # ---- Retrieve ----
@@ -731,6 +772,27 @@ def main(argv: list[str]) -> int:
         help="RRF 平滑常数 k（hybrid 模式生效，覆盖 [rag].rrf_k，默认 60）。",
     )
     parser.add_argument(
+        "--chroma",
+        action="store_true",
+        help="启用 Chroma 持久化向量库（W3D5 C1，覆盖 [rag.chroma].enabled）。"
+        "C1 阶段：embedding 写入 persist_dir 落盘；二次启动仍重建（C2 在 W3D6 实现）。",
+    )
+    parser.add_argument(
+        "--no-chroma",
+        action="store_true",
+        help="禁用 Chroma 持久化（覆盖 [rag.chroma].enabled）。",
+    )
+    parser.add_argument(
+        "--chroma-persist-dir",
+        default=None,
+        help="Chroma 持久化目录（覆盖 [rag.chroma].persist_dir，默认 ./chroma_db）。",
+    )
+    parser.add_argument(
+        "--chroma-collection",
+        default=None,
+        help="Chroma collection 名（覆盖 [rag.chroma].collection_name，默认 rag_default）。",
+    )
+    parser.add_argument(
         "--rag-qa-template-file",
         default=None,
         help="从文件读取 RAG 回答模板，最高优先级。",
@@ -840,6 +902,20 @@ def main(argv: list[str]) -> int:
         bm25_tokenizer_name = args.bm25_tokenizer or _cfg_get(cfg, ["rag", "bm25_tokenizer"], "jieba")
         rrf_k = args.rrf_k if args.rrf_k is not None else int(_cfg_get(cfg, ["rag", "rrf_k"], 60))
 
+        # Chroma 持久化（W3D5 C1）
+        if args.no_chroma:
+            chroma_enabled = False
+        elif args.chroma:
+            chroma_enabled = True
+        else:
+            chroma_enabled = bool(_cfg_get(cfg, ["rag", "chroma", "enabled"], False))
+        chroma_persist_dir = args.chroma_persist_dir or _cfg_get(
+            cfg, ["rag", "chroma", "persist_dir"], "./chroma_db"
+        )
+        chroma_collection = args.chroma_collection or _cfg_get(
+            cfg, ["rag", "chroma", "collection_name"], "rag_default"
+        )
+
         # 回答模板优先级（W3D4 加入题型路由）：
         #   1) --rag-qa-template-file <path>        显式文件，最高优先级
         #   2) --question-type <type> / default_question_type
@@ -887,13 +963,18 @@ def main(argv: list[str]) -> int:
                 qa_template = cfg_tmpl
                 template_source = "toml.qa_template"
 
+        chroma_log = (
+            f"on(persist_dir={chroma_persist_dir}, collection={chroma_collection})"
+            if chroma_enabled
+            else "off"
+        )
         logger.info(
             "rag=on retriever=%s data_dir=%s top_k=%s chunk=%s/%s bm25_tok=%s rrf_k=%s "
-            "llm=%s embed=%s key=%s template=%s",
+            "llm=%s embed=%s key=%s template=%s chroma=%s",
             retriever_mode, data_dir, rag_top_k, chunk_size, chunk_overlap,
             bm25_tokenizer_name, rrf_k,
             rag_llm_model, rag_embed_model, _mask_key(glm_key),
-            template_source,
+            template_source, chroma_log,
         )
         try:
             answer_with_rag(
@@ -910,6 +991,9 @@ def main(argv: list[str]) -> int:
                 rrf_k=int(rrf_k),
                 streaming=stream_enabled,
                 qa_template=qa_template,
+                chroma_enabled=chroma_enabled,
+                chroma_persist_dir=str(chroma_persist_dir),
+                chroma_collection=str(chroma_collection),
             )
         except Exception as e:
             logger.error("%s", e)

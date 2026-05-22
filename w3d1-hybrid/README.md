@@ -196,6 +196,66 @@ python hello-world.py --rag --retriever hybrid --rag-top-k 5 \
 3. **可评估**：题型标签是按题型分组算成功率的前置条件，是 W4 ragas 评估的输入。**整体准确率告诉不了你"该改 prompt 还是该改 retriever"**。
 4. **可演进**：今天 `--question-type` 是手动指定（V1）；V2 可以接一个便宜小模型做题型分类 agent，从手动 RAG 走向 Agent-based RAG，路由表不动。
 
+## W3D5：Chroma 持久化（C1 阶段）
+
+W3D1 - W3D4 的所有 RAG 索引都建在内存里（LlamaIndex 默认的 `SimpleVectorStore`）。每次启动 → 切 nodes → 算 embedding → 建索引 → 进程退出，索引全没。16KB 测试语料 18 个 node 跑一次要发 22 次 `/embeddings` 请求，生产场景下每次重算又慢又费 token。
+
+W3D5 把向量存储换成 [Chroma](https://www.trychroma.com/) 的 `PersistentClient`，embedding 落盘到本地目录，**跑一次能看见数据真的在那**。
+
+### C1 / C2 切两段（W3D5 / W3D6）
+
+- **C1（本次）**：只做 ingest + persist。第一次跑 → 算 embedding → 写入 `./chroma_db/`；**第二次跑仍会重新切 + 重算 embedding 再写入同一 collection**（等价"每次重建索引但写到磁盘"）。功能上现在还看不到"省 token"的收益，但**持久化通路通了** —— 下一步只需在 query 时跳过 ingest 直接 load 就能拿到真正的索引复用。
+- **C2（W3D6 5.23）**：query-time 直接从 `./chroma_db/` 加载，跳过切片+嵌入，验证 query 结果与 C1 首次一致。这才是真省 token 的形态。
+
+切两段的理由：W3D5 周五降级日预算只有 60 分硬上限，做不完一整个回路。先把"会写"做扎实，周六再做"会读"。
+
+### 启用方式
+
+```bash
+python hello-world.py --rag --retriever hybrid --chroma \
+  --question "VFD-F17 是什么报警？" --log-level INFO
+```
+
+或在 `hello-world.toml` 里：
+
+```toml
+[rag.chroma]
+enabled = true
+persist_dir = "./chroma_db"
+collection_name = "rag_default"
+```
+
+CLI 覆盖配置文件：`--chroma` / `--no-chroma` / `--chroma-persist-dir` / `--chroma-collection`。日志里会看到一行 `已启用 Chroma 持久化向量库（persist_dir=./chroma_db, collection=rag_default, mode=ingest+persist）`，能直接确认走的是哪条路。
+
+### 跑完磁盘上有什么
+
+```
+chroma_db/
+├── chroma.sqlite3                              # ~1.2 MB，collection metadata + embedding 引用
+└── 52873757-a65b-4648-80f9-6425960d76fe/       # collection UUID 目录（HNSW 向量索引）
+```
+
+`chroma.sqlite3` 是 Chroma 用 SQLite 维护的 collection / document / embedding 元数据；UUID 子目录里是底层 HNSW 向量索引文件。两路 retriever 行为对比（同一份 `data/lzy.md`、`chunk_size=200`、`top_k=1`、问"李哲羽多大?"）：
+
+| 模式 | 首次跑用时 | embedding 请求数 | 磁盘落盘 | 答案 |
+|---|---|---|---|---|
+| `--no-chroma`（W3D4 行为） | ~11s | 1（只算 query） | 无 | "30 岁" |
+| `--chroma`（W3D5 C1） | ~74s | 22（22 个 node 全部 ingest）| `chroma_db/` 2.5 MB | "30 岁" |
+
+C1 首次跑慢是预期 —— 把所有 node 都送 embedding 接口才能写盘。**省 token 的形态在 C2 才能看到**：二次启动直接 load 已落盘的 embedding，跳过整个 ingest 阶段。
+
+### 工程小决策
+
+- **`get_or_create_collection`** 而非 `create_collection`：容许同一 collection 多次 ingest（开发期友好）；生产场景需要"幂等 ingest"要换成基于文件 hash 的去重，留给 W4 ragas 评估改造一起做。
+- **`PersistentClient` 而非 `Client`**：前者立即把所有写入落盘（WAL），后者只在显式 `persist()` 时落盘。`PersistentClient` 对"跑完关进程不丢"更稳。
+- **`chroma_db/` 进 .gitignore**：索引文件 + sqlite3 不进仓（占空间、二进制、依赖本地路径）。要恢复时 `--chroma` 重跑一次即可重建。
+- **默认 `[rag.chroma].enabled = false`**：新增字段不破坏现有 hybrid 路径，需要持久化时显式开启。
+
+### 顺手清的两项 W3D1 backlog
+
+- **backlog #10**：`requirements.txt` 锁版本 —— 原来是 `llama-index>=0.11` 这类宽松范围，现在全部锁到 `==<具体版本号>`（基于 `pip freeze` 实测装好的版本），保证 reproducible。
+- **backlog #11**：`llama-index-readers-file` 显式声明 —— 原依赖 `llama-index` 主包带入（transitive 安装、版本随主包飘），现显式声明 `==0.6.0`。今天 ingest 走的是 `SimpleDirectoryReader`，未来要读 PDF / docx 时这条声明就生效了。
+
 ## 关键配置（hello-world.toml `[rag]` 段）
 
 | 字段 | 默认 | 说明 |

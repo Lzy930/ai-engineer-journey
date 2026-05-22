@@ -37,3 +37,8 @@ Thumbs.db
 # === 日志 ===
 *.log
 logs/
+
+# === Chroma 持久化向量库（W3D5 C1）===
+# 本地落盘的 embedding 索引，不进仓
+chroma_db/
+*.sqlite3

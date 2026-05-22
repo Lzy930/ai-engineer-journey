@@ -127,3 +127,20 @@ subjective = "prompts/qa_subjective.txt"
 # high_risk_strict = "prompts/qa_high_risk.txt"
 # comparison       = "prompts/qa_comparison.txt"
 
+# ===== Chroma 持久化向量库（W3D5 加入，C1 阶段）=====
+#
+# 现状（不开启时）：每次启动 → 切 nodes → 算 embedding → 写入内存 SimpleVectorStore。
+# 进程一退,索引就没。16KB 测试语料还行，生产场景下每次跑都重算 embedding 又慢又费 token。
+#
+# 开启 chroma 后（C1 阶段）：embedding 会落到 persist_dir，跑完磁盘上能看到数据。
+# 注意：C1 只做 ingest + 落盘。**第二次启动仍会重新切 + 重算 embedding 再写入**
+# （等价于"每次都重建索引到磁盘"，但至少证明持久化通路是通的）。
+# "二次启动直接 load 索引、跳过 ingest" 留给 W3D6 (5.23) C2 阶段。
+#
+# 命令行 --chroma / --no-chroma 覆盖 enabled；
+# --chroma-persist-dir / --chroma-collection 覆盖路径与集合名。
+[rag.chroma]
+enabled = false
+persist_dir = "./chroma_db"
+collection_name = "rag_default"
+
