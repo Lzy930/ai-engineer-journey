@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -352,6 +353,65 @@ class RAGComponents:
 BM25_TOKEN_PATTERN_CN = r"(?u)\w+|[\u4e00-\u9fff]"
 
 
+# ════ W3D5 C2:Chroma 持久化复用 ════
+# C1 阶段（commit 665adc3）只做了 ingest + persist —— embedding 落盘但二次启动还会
+# 重新切 nodes + 重算 embedding + upsert。本段把"data/ 没变就跳过整个 ingest"做出来。
+#
+# 判断"data/ 没变"用 fingerprint:每个文件的 (rel_path, mtime, size) 排好序 JSON 化。
+# 任一文件新增/删除/改大小/改 mtime 都会改变指纹,触发 re-ingest。
+#
+# 当前仅 vector 模式支持 C2 复用;hybrid 模式因 BM25 需要 nodes,留 W3D6 (5.23)
+# 用 "从 chroma 捞 nodes 重建 BM25" 的方案 A 解决(详见 5.22 日记 "C2 开工前必看")。
+
+_FINGERPRINT_FILE = ".data_fingerprint.json"
+
+
+def _compute_data_fingerprint(data_dir: str) -> dict[str, Any]:
+    """计算 data/ 目录的指纹用于判断'是否需要重 ingest'。
+
+    指纹组成:每个文件的 (相对路径, mtime 取整秒, 字节大小)。
+    隐藏文件(. 开头)和 .pyc/.pyo 不计入。
+    """
+    files: list[dict[str, Any]] = []
+    if not os.path.isdir(data_dir):
+        return {"files": []}
+    for root, _, filenames in os.walk(data_dir):
+        for fn in filenames:
+            if fn.startswith(".") or fn.endswith((".pyc", ".pyo")):
+                continue
+            full = os.path.join(root, fn)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, data_dir)
+            files.append({"path": rel, "mtime": int(stat.st_mtime), "size": stat.st_size})
+    return {"files": sorted(files, key=lambda x: x["path"])}
+
+
+def _fingerprint_path(persist_dir: str) -> str:
+    return os.path.join(persist_dir, _FINGERPRINT_FILE)
+
+
+def _load_stored_fingerprint(persist_dir: str) -> Optional[dict[str, Any]]:
+    path = _fingerprint_path(persist_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_fingerprint(persist_dir: str, fp: dict[str, Any]) -> None:
+    os.makedirs(persist_dir, exist_ok=True)
+    path = _fingerprint_path(persist_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(fp, f, ensure_ascii=False, indent=2)
+    logger.info("已写入 data/ 指纹到 %s(%d 个文件)", path, len(fp.get("files", [])))
+
+
 def reciprocal_rank_fusion(
     rank_lists: list[list[Any]],
     k: int = 60,
@@ -438,6 +498,76 @@ def _build_rag_components(
     Settings.llm = ZhipuAI(model=llm_model, api_key=api_key)
     Settings.embed_model = ZhipuAIEmbedding(model=embed_model, api_key=api_key)
 
+    # ════ W3D5 C2:vector 模式 + chroma 启用时,尝试从已落盘 chroma_db/ 复用 ════
+    # 命中条件:① data/ 指纹与 chroma_db/.data_fingerprint.json 一致
+    #          ② chroma collection 行数 > 0
+    # 命中时:跳过 SimpleDirectoryReader / SentenceSplitter / 22 次 embedding API 调用,
+    #        直接 VectorStoreIndex.from_vector_store —— 真省 token 的形态。
+    # hybrid 模式不走此分支(BM25 仍需 nodes,留 W3D6 处理)。
+    if chroma_enabled and retriever_mode == "vector":
+        persist_dir_check = chroma_persist_dir or "./chroma_db"
+        coll_name_check = chroma_collection or "rag_default"
+        if os.path.isdir(persist_dir_check):
+            try:
+                import chromadb
+                from llama_index.core import StorageContext
+                from llama_index.vector_stores.chroma import ChromaVectorStore
+            except ImportError as e:
+                raise RuntimeError(
+                    "缺少 Chroma 依赖。请先安装：\n"
+                    "  .venv/bin/pip install chromadb llama-index-vector-stores-chroma\n"
+                    f"详情：{e}"
+                ) from e
+
+            current_fp = _compute_data_fingerprint(data_dir)
+            stored_fp = _load_stored_fingerprint(persist_dir_check)
+            try:
+                ck = chromadb.PersistentClient(path=persist_dir_check)
+                cc = ck.get_or_create_collection(coll_name_check)
+                row_count = cc.count()
+            except Exception as e:
+                logger.warning("Chroma 复用检测失败,回落 ingest 路径:%s", e)
+                row_count = 0
+                stored_fp = None
+
+            if stored_fp == current_fp and row_count > 0:
+                logger.info(
+                    "⭐ Chroma 复用模式:data/ 指纹匹配 + collection 已有 %d 行 → 跳过 ingest,直接 load",
+                    row_count,
+                )
+                vector_store = ChromaVectorStore(chroma_collection=cc)
+                vector_index = VectorStoreIndex.from_vector_store(vector_store)
+                vec_retriever = vector_index.as_retriever(similarity_top_k=top_k)
+                logger.info("已构建向量 retriever（从 Chroma 复用,top_k=%d）", top_k)
+
+                # synthesizer 仍需构建（任何模式都需要）
+                synth_kwargs: dict[str, Any] = {"streaming": streaming}
+                if qa_template:
+                    tmpl = qa_template.strip()
+                    missing = [p for p in ("{context_str}", "{query_str}") if p not in tmpl]
+                    if missing:
+                        raise RuntimeError(
+                            f"RAG qa_template 缺少必须占位符：{missing}（必须同时包含 {{context_str}} 和 {{query_str}}）"
+                        )
+                    synth_kwargs["text_qa_template"] = PromptTemplate(tmpl)
+                    logger.info("已应用自定义 RAG qa_template（%d chars）", len(tmpl))
+                response_synthesizer = get_response_synthesizer(**synth_kwargs)
+
+                return RAGComponents(
+                    nodes=[],
+                    vec_retriever=vec_retriever,
+                    bm25_retriever=None,
+                    response_synthesizer=response_synthesizer,
+                )
+            else:
+                if stored_fp is None:
+                    logger.info("Chroma 首次跑(无历史指纹) → 走 ingest 路径")
+                elif stored_fp != current_fp:
+                    logger.info("Chroma data/ 变化检测到(指纹不匹配)→ 清旧数据 + 重新 ingest")
+                elif row_count == 0:
+                    logger.info("Chroma collection 为空 → 走 ingest 路径")
+    # ═══════════════════════════════════════════════════════════════════
+
     documents = SimpleDirectoryReader(data_dir).load_data()
     if not documents:
         raise RuntimeError(f"目录 {data_dir} 内没有可加载的文档")
@@ -456,10 +586,11 @@ def _build_rag_components(
     bm25_retriever = None
 
     if retriever_mode in ("vector", "hybrid"):
-        # W3D5 C1：若开启 Chroma 持久化，把向量存储从内存 SimpleVectorStore 换成
-        # ChromaVectorStore（PersistentClient 写盘）。本阶段只做 ingest + 落盘；
-        # 二次启动仍会重建（重算 embedding 后写入同一 collection）。
-        # 二次启动跳过 ingest、直接 load 索引复用，留给 W3D6 (5.23) C2 阶段。
+        # W3D5 C1/C2：若开启 Chroma 持久化,把向量存储从内存 SimpleVectorStore 换成
+        # ChromaVectorStore（PersistentClient 写盘）。
+        # - C1：ingest + 落盘
+        # - C2：vector 模式 + data/ 未变 时,函数顶部已经早期返回(复用 chroma 数据);
+        #       走到这里说明需要 re-ingest(首次 / data/ 变化 / hybrid 模式)
         storage_context = None
         if chroma_enabled:
             try:
@@ -478,6 +609,20 @@ def _build_rag_components(
             os.makedirs(persist_dir, exist_ok=True)
             chroma_client = chromadb.PersistentClient(path=persist_dir)
             chroma_collection_obj = chroma_client.get_or_create_collection(coll_name)
+
+            # W3D5 C2：指纹不匹配且 collection 非空时,先清旧数据再 ingest,防 node 堆积
+            current_fp = _compute_data_fingerprint(data_dir)
+            stored_fp = _load_stored_fingerprint(persist_dir)
+            if (
+                stored_fp is not None
+                and stored_fp != current_fp
+                and chroma_collection_obj.count() > 0
+            ):
+                old_count = chroma_collection_obj.count()
+                logger.info("data/ 已变化:清空 collection 中 %d 个旧 node", old_count)
+                chroma_client.delete_collection(coll_name)
+                chroma_collection_obj = chroma_client.get_or_create_collection(coll_name)
+
             vector_store = ChromaVectorStore(chroma_collection=chroma_collection_obj)
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
             logger.info(
@@ -487,6 +632,9 @@ def _build_rag_components(
 
         if storage_context is not None:
             vector_index = VectorStoreIndex(nodes, storage_context=storage_context)
+            # W3D5 C2：ingest 完成后写入指纹,供下次启动判断复用
+            if chroma_enabled:
+                _save_fingerprint(chroma_persist_dir or "./chroma_db", current_fp)
         else:
             vector_index = VectorStoreIndex(nodes)
         vec_retriever = vector_index.as_retriever(similarity_top_k=top_k)
