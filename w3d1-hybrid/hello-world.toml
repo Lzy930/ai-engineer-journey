@@ -1,0 +1,146 @@
+[app]
+# 日志级别：CRITICAL / ERROR / WARNING / INFO / DEBUG
+log_level = "ERROR"
+
+# 是否流式输出（true/false）
+stream = true
+
+# 默认提供方：claude / glm（命令行 --provider 会覆盖）
+provider = "glm"
+
+# 默认 key 来源：env / paste（命令行 --key-source 会覆盖）
+key_source = "env"
+
+# 默认提示词（命令行 --prompt 会覆盖）
+prompt = "用一句话欢迎我——一位制造业 IT 负责人，今天迈出了转型 AI 应用工程师的第一步。"
+
+# 默认最大输出 token（命令行 --max-tokens 会覆盖）
+max_tokens = 300
+
+[claude]
+# 默认 Claude 模型（命令行 --claude-model 会覆盖）
+model = "claude-haiku-4-5"
+
+# 也可以把 key 放这里（不推荐明文保存）；若设置则优先于环境变量/粘贴
+# api_key = ""
+
+[glm]
+# GLM 的 OpenAI 兼容 base_url
+base_url = "https://open.bigmodel.cn/api/paas/v4/"
+
+# 默认 GLM 模型（命令行 --glm-model 会覆盖）
+model = "glm-5.1"
+
+# 也可以把 key 放这里（不推荐明文保存）；若设置则优先于环境变量/粘贴
+# api_key = ""
+
+[rag]
+# 是否默认启用 RAG（基于本地文档）。
+# 不写或留空时，运行不指定 --rag/--no-rag 会进入交互询问。
+# enabled = false
+
+# 文档目录（相对工作目录或绝对路径）。会读取该目录下的所有可解析文档。
+data_dir = "data"
+
+# 检索时取最相似的前 K 个片段
+top_k = 3
+
+# 检索器类型（W3D1 新增）：
+#   vector — 只走向量相似度（原 W1D1 行为）
+#   bm25   — 只走 BM25 关键词匹配
+#   hybrid — 两路同时检索，RRF 排名融合
+# 命令行 --retriever 会覆盖此项。
+retriever = "hybrid"
+
+# 文档切片参数（W3D1 新增）：从隐式切片改为显式可控
+# chunk_size 越大，单 node 信息越完整但召回越粗；越小则越细。
+chunk_size = 512
+chunk_overlap = 50
+
+# BM25 中文分词策略（W3D1 字段，W3D4 修正）。
+# 历史：W3D1 时配置 jieba/char 选择"分词函数"，但 BM25Retriever 的 tokenizer 参数实际被
+# 静默丢弃，jieba 从未生效（详见 w3d1-hybrid/README.md "5.21 BM25 真相反转"）。
+# 现状：BM25 用写死的中文 char-level token_pattern（英文/数字按 word，中文按字）。
+# 此字段当前**不影响实际行为**，仅作为 W4"真正词级 jieba BM25"实现时的开关位预留。
+bm25_tokenizer = "jieba"
+
+# RRF 融合常数 k（hybrid 模式生效）。
+# RRF 公式：score(node) = Σ 1 / (rrf_k + rank_i)
+# 业界经验值 60，越大越平滑（拉低高 rank 的优势）。
+rrf_k = 60
+
+# RAG 用的 LLM 模型（智谱）
+llm_model = "glm-4-plus"
+
+# RAG 用的 embedding 模型（智谱）
+embed_model = "embedding-3"
+
+# ===== RAG 回答模板（W3D4 加入题型路由）=====
+#
+# 必须包含两个占位符：{context_str}（检索到的资料）和 {query_str}（用户问题）。
+# 不设任何模板时使用 LlamaIndex 默认（英文 prompt，可跑中文，但不可控）。
+#
+# 三种指定方式（优先级 1 > 2 > 3 > 4）：
+#   1. 命令行 --rag-qa-template-file <path>  显式文件，调试最方便
+#   2. 命令行 --question-type <type>          语义路由，查 [rag.templates] 表
+#   3. toml 下方 qa_template 字段             老字段，兼容 W3D1 以前的行为
+#   4. (不设)                                 LlamaIndex 默认英文 prompt
+#
+# default_question_type：不传 --question-type 时使用的默认题型。
+# 留空字符串 "" 表示"不走语义路由，走第 3 优先级 qa_template 字段"（向后兼容）。
+default_question_type = ""
+
+# 旧版兜底模板（W3D1 及之前的默认行为）。一旦上面 default_question_type 设了非空值
+# 或命令行传了 --question-type/--rag-qa-template-file，下方 qa_template 会被忽略。
+qa_template = """
+你只能使用【资料】中的明确信息回答问题。
+凡是资料中没有直接出现、无法被原文明确支持的内容，一律视为"不知道"。
+
+禁止：
+- 猜测
+- 推理过度
+- 使用外部知识
+- 使用经验判断
+- 自动补全缺失信息
+- 给出没有引用依据的结论
+
+如果问题无法被资料支持，请只回答：
+"无法从已提供资料中判断。"
+
+不要为了显得有帮助而扩展回答。
+
+【资料】
+{context_str}
+
+【问题】
+{query_str}
+
+【回答】
+"""
+
+# 题型 → 模板文件 映射。新增题型只需在此表加一行 + 写对应 prompts/xxx.txt 文件。
+# (子表必须在 [rag] 段所有标量字段之后，这是 toml 语法要求)
+[rag.templates]
+factual    = "prompts/qa_factual.txt"
+subjective = "prompts/qa_subjective.txt"
+# 未来扩展示例：
+# high_risk_strict = "prompts/qa_high_risk.txt"
+# comparison       = "prompts/qa_comparison.txt"
+
+# ===== Chroma 持久化向量库（W3D5 加入，C1 阶段）=====
+#
+# 现状（不开启时）：每次启动 → 切 nodes → 算 embedding → 写入内存 SimpleVectorStore。
+# 进程一退,索引就没。16KB 测试语料还行，生产场景下每次跑都重算 embedding 又慢又费 token。
+#
+# 开启 chroma 后（C1 阶段）：embedding 会落到 persist_dir，跑完磁盘上能看到数据。
+# 注意：C1 只做 ingest + 落盘。**第二次启动仍会重新切 + 重算 embedding 再写入**
+# （等价于"每次都重建索引到磁盘"，但至少证明持久化通路是通的）。
+# "二次启动直接 load 索引、跳过 ingest" 留给 W3D6 (5.23) C2 阶段。
+#
+# 命令行 --chroma / --no-chroma 覆盖 enabled；
+# --chroma-persist-dir / --chroma-collection 覆盖路径与集合名。
+[rag.chroma]
+enabled = false
+persist_dir = "./chroma_db"
+collection_name = "rag_default"
+
